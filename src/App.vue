@@ -1,8 +1,26 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
-import { courseForLesson, exportRecords, lessonById, persist, saveAttempt, setDownloaded, state, updateTokenClassification } from './store';
-import type { ErrorCategory, Lesson, PracticeAttempt, PracticeView } from './types';
-import { compareSentence, scoreAttempt, segmentText } from './utils';
+import {
+  activeAppealForSentence,
+  appealsByRecency,
+  appealsForSentence,
+  courseForLesson,
+  createAppeal,
+  decideAppeal,
+  exportRecords,
+  findAttempt,
+  lessonById,
+  pendingAppealCount,
+  persist,
+  resolveStaleDecision,
+  saveAttempt,
+  setDownloaded,
+  state,
+  updateTokenClassification,
+  withdrawAppeal
+} from './store';
+import type { AppealDecision, AppealStatus, ErrorCategory, Lesson, PracticeAttempt, PracticeView, SentenceAppeal } from './types';
+import { cloneData, gradeSentence, scoreAttempt, segmentText } from './utils';
 
 const view = ref<PracticeView>(state.activeLessonId ? 'practice' : 'library');
 const online = ref(navigator.onLine);
@@ -13,6 +31,11 @@ const segmentStart = ref(0);
 const segmentEnd = ref(1);
 const teacherAttemptId = ref(state.attempts[0]?.id ?? '');
 const teacherDraft = ref(state.attempts[0]?.teacherFeedback ?? '');
+// 学习端逐句申诉表单
+const appealCorrection = ref('');
+const appealReason = ref('');
+// 教师页每单的处理意见草稿（驳回原因）
+const teacherAppealNotes = ref<Record<string, string>>({});
 let toastTimer = 0;
 
 const activeLesson = computed(() => lessonById(state.activeLessonId));
@@ -35,9 +58,37 @@ const lessonCompletion = computed(() => {
 });
 const resultAttempt = computed(() => state.attempts.find((attempt) => attempt.id === resultAttemptId.value));
 const resultSentence = computed(() => resultAttempt.value?.sentenceAttempts[selectedResultSentence.value]);
+const resultSentenceAppeals = computed<SentenceAppeal[]>(() =>
+  resultAttempt.value && resultSentence.value
+    ? appealsForSentence(resultAttempt.value.id, resultSentence.value.sentenceId)
+    : []
+);
+const resultSentenceActiveAppeal = computed<SentenceAppeal | undefined>(() =>
+  resultAttempt.value && resultSentence.value
+    ? activeAppealForSentence(resultAttempt.value.id, resultSentence.value.sentenceId)
+    : undefined
+);
+// 结果页句子导航用：哪些句子存在待处理申诉
+const pendingAppealBySentence = computed<Record<string, boolean>>(() => {
+  const map: Record<string, boolean> = {};
+  state.appeals.forEach((appeal) => {
+    if (appeal.status === 'pending') map[`${appeal.attemptId}:${appeal.sentenceId}`] = true;
+  });
+  return map;
+});
 const teacherAttempt = computed(() => state.attempts.find((attempt) => attempt.id === teacherAttemptId.value));
+const teacherAppeals = computed<SentenceAppeal[]>(() => appealsByRecency());
 const totalWords = computed(() => state.attempts.flatMap((attempt) => attempt.sentenceAttempts).flatMap((item) => item.tokens).length);
 const correctedWords = computed(() => state.attempts.flatMap((attempt) => attempt.sentenceAttempts).flatMap((item) => item.tokens).filter((token) => !token.correct && token.category !== 'unclassified').length);
+
+const appealStatusMeta: Record<AppealStatus, { label: string; tone: string }> = {
+  pending: { label: '待教师处理', tone: 'pending' },
+  approved: { label: '教师已通过', tone: 'approved' },
+  rejected: { label: '教师已驳回', tone: 'rejected' },
+  withdrawn: { label: '已撤回', tone: 'withdrawn' },
+  superseded: { label: '旧单已失效', tone: 'superseded' },
+  conflict: { label: '冲突 · 未写回', tone: 'conflict' }
+};
 
 const categoryOptions: Array<{ value: ErrorCategory; label: string }> = [
   { value: 'unclassified', label: '未分类' },
@@ -124,17 +175,27 @@ function submitLesson() {
   const sentenceAttempts = lesson.sentences.map((sentence) => {
     const source = sentence.text;
     const answer = progress?.answers[sentence.id] ?? '';
-    const tokens = compareSentence(source, answer);
-    const correct = tokens.filter((token) => token.correct).length;
-    return { sentenceId: sentence.id, source, answer, tokens, score: tokens.length ? Math.round((correct / tokens.length) * 100) : 0 };
+    const { tokens, score } = gradeSentence(source, answer);
+    return {
+      sentenceId: sentence.id,
+      source,
+      answer,
+      tokens: cloneData(tokens),
+      score,
+      originalAnswer: answer,
+      originalScore: score,
+      originalTokens: cloneData(tokens)
+    };
   });
+  const totalScore = scoreAttempt(sentenceAttempts);
   const attempt: PracticeAttempt = {
     id: `attempt-${Date.now()}`,
     lessonId: lesson.id,
     lessonTitle: lesson.title,
     courseTitle: course.title,
     submittedAt: new Date().toISOString(),
-    score: scoreAttempt(sentenceAttempts),
+    score: totalScore,
+    originalScore: totalScore,
     sentenceAttempts,
     teacherFeedback: ''
   };
@@ -175,6 +236,53 @@ function replaySegment() {
 function selectResultSentence(index: number) {
   selectedResultSentence.value = index;
   syncSegment();
+}
+
+// 切换句子时，用当前答案预填订正框，方便按连读/同义表达小改。
+watch([selectedResultSentence, resultAttemptId, resultSentenceAppeals], () => {
+  appealReason.value = '';
+  const active = resultSentenceActiveAppeal.value;
+  appealCorrection.value = active ? active.correctedAnswer : (resultSentence.value?.answer ?? '');
+}, { immediate: true });
+
+function submitAppeal() {
+  const attempt = resultAttempt.value;
+  const sentence = resultSentence.value;
+  if (!attempt || !sentence) return;
+  const result = createAppeal(attempt.id, sentence.sentenceId, appealCorrection.value, appealReason.value);
+  notify(result.message);
+  if (result.ok) {
+    appealReason.value = '';
+    persist();
+  }
+}
+
+function withdrawCurrentAppeal(appealId: string) {
+  const result = withdrawAppeal(appealId);
+  notify(result.message);
+  if (result.ok) persist();
+}
+
+function teacherDecideAppeal(appeal: SentenceAppeal, decision: AppealDecision) {
+  const result = decideAppeal(appeal.id, decision, teacherAppealNotes.value[appeal.id] ?? '');
+  notify(result.message);
+  if (result.ok) {
+    teacherAppealNotes.value[appeal.id] = '';
+    persist();
+  }
+}
+
+function teacherResolveStale(appeal: SentenceAppeal, decision: AppealDecision) {
+  const result = resolveStaleDecision(appeal.id, decision, teacherAppealNotes.value[appeal.id] ?? '');
+  notify(result.message);
+  if (result.ok) {
+    teacherAppealNotes.value[appeal.id] = '';
+    persist();
+  }
+}
+
+function appealAttempt(appeal: SentenceAppeal): PracticeAttempt | undefined {
+  return findAttempt(appeal.attemptId);
 }
 
 function saveClassification(attemptId: string, sentenceId: string, tokenIndex: number, category: ErrorCategory, reason: string) {
@@ -294,7 +402,13 @@ onBeforeUnmount(() => {
         <div class="section-head"><h3>最近练习</h3><span>{{ state.attempts.length }} 条记录</span></div>
         <article v-if="state.attempts.length" class="panel">
           <div v-for="attempt in state.attempts.slice(0, 4)" :key="attempt.id" class="history-card">
-            <div class="history-top"><strong>{{ attempt.lessonTitle }}</strong><span class="history-score">{{ attempt.score }} 分</span></div>
+            <div class="history-top">
+              <strong>{{ attempt.lessonTitle }}</strong>
+              <span class="history-score">
+                {{ attempt.score }} 分
+                <small v-if="attempt.originalScore !== undefined && attempt.originalScore !== attempt.score" class="score-old">（原判 {{ attempt.originalScore }}）</small>
+              </span>
+            </div>
             <p>{{ formatDate(attempt.submittedAt) }} · {{ attempt.teacherFeedback || '暂无教师反馈' }}</p>
           </div>
           <var-button block type="primary" variant="outline" @click="downloadRecords">导出全部练习记录</var-button>
@@ -350,16 +464,23 @@ onBeforeUnmount(() => {
           <div class="score-ring" :style="{ '--score': `${resultAttempt.score}%` }"><strong>{{ resultAttempt.score }}</strong></div>
           <h2>{{ resultAttempt.score >= 90 ? '几乎完美' : resultAttempt.score >= 70 ? '继续打磨细节' : '再听一遍会更好' }}</h2>
           <p>{{ resultAttempt.lessonTitle }} · 点击红色词可单独重听，并记录错误原因。</p>
+          <p v-if="resultAttempt.originalScore !== undefined && resultAttempt.originalScore !== resultAttempt.score" class="score-version">
+            申诉处理前整课 {{ resultAttempt.originalScore }} 分 → 处理后 {{ resultAttempt.score }} 分
+          </p>
+          <p v-else class="score-version muted">当前成绩即提交时原判，尚未被申诉改动</p>
         </section>
 
         <div class="sentence-picker">
-          <button v-for="(attempt, index) in resultAttempt.sentenceAttempts" :key="attempt.sentenceId" class="sentence-dot" :class="{ active: index === selectedResultSentence }" @click="selectResultSentence(index)">{{ index + 1 }}</button>
+          <button v-for="(attempt, index) in resultAttempt.sentenceAttempts" :key="attempt.sentenceId" class="sentence-dot" :class="{ active: index === selectedResultSentence, done: !!pendingAppealBySentence[`${resultAttempt.id}:${attempt.sentenceId}`] }" :aria-label="`第 ${index + 1} 句，有申诉`" @click="selectResultSentence(index)">{{ index + 1 }}</button>
         </div>
 
         <section v-if="resultSentence" class="panel token-panel">
           <div class="detail-head">
             <div><h3>第 {{ selectedResultSentence + 1 }} 句逐词结果</h3><p>{{ resultSentence.source }}</p></div>
-            <span class="history-score">{{ resultSentence.score }}%</span>
+            <span class="history-score">
+              {{ resultSentence.score }}%
+              <small v-if="resultSentence.originalScore !== undefined && resultSentence.originalScore !== resultSentence.score" class="score-old">（原判 {{ resultSentence.originalScore }}%）</small>
+            </span>
           </div>
           <div class="word-list">
             <button v-for="token in resultSentence.tokens" :key="`${token.index}-${token.expected}-${token.actual}`" class="word-chip" :class="{ wrong: !token.correct }" :title="token.correct ? '点击重听' : `你的答案：${token.actual || '未输入'}`" @click="replay(token.expected || token.actual, 0.7)">
@@ -388,6 +509,53 @@ onBeforeUnmount(() => {
               </div>
             </div>
           </div>
+
+          <div class="appeal-zone">
+            <div class="dictation-label"><strong>逐句申诉</strong><span>连读、同义表达被判错时可发起</span></div>
+
+            <!-- 待处理中的单子：不能重复开单，可在处理前撤回 -->
+            <div v-if="resultSentenceActiveAppeal" class="appeal-card" :data-tone="appealStatusMeta[resultSentenceActiveAppeal.status].tone">
+              <div class="appeal-head">
+                <span class="appeal-badge">{{ appealStatusMeta[resultSentenceActiveAppeal.status].label }}</span>
+                <span class="appeal-time">{{ formatDate(resultSentenceActiveAppeal.createdAt) }}</span>
+              </div>
+              <div class="appeal-grid">
+                <div><small>原答案（原判 {{ resultSentenceActiveAppeal.originalScore }} 分）</small><p>{{ resultSentenceActiveAppeal.originalAnswer || '（空）' }}</p></div>
+                <div><small>订正答案（拟判 {{ resultSentenceActiveAppeal.correctedScore }} 分）</small><p>{{ resultSentenceActiveAppeal.correctedAnswer }}</p></div>
+              </div>
+              <p v-if="resultSentenceActiveAppeal.reason" class="appeal-reason">申诉理由：{{ resultSentenceActiveAppeal.reason }}</p>
+              <p class="appeal-hint">教师处理通过后才会更新本句与整课成绩；处理前可撤回并用新订重重提。</p>
+              <var-button block type="default" variant="outline" @click="withdrawCurrentAppeal(resultSentenceActiveAppeal.id)">撤回本单并重提</var-button>
+            </div>
+
+            <template v-else>
+              <!-- 历史申诉单：处理前后版本、驳回原因、冲突缘由都可核对 -->
+              <div v-for="appeal in resultSentenceAppeals" :key="appeal.id" class="appeal-card" :data-tone="appealStatusMeta[appeal.status].tone">
+                <div class="appeal-head">
+                  <span class="appeal-badge">{{ appealStatusMeta[appeal.status].label }}</span>
+                  <span class="appeal-time">{{ formatDate(appeal.createdAt) }}</span>
+                </div>
+                <div class="appeal-grid">
+                  <div><small>原答案 · {{ appeal.originalScore }} 分</small><p>{{ appeal.originalAnswer || '（空）' }}</p></div>
+                  <div><small>订正答案 · {{ appeal.correctedScore }} 分</small><p>{{ appeal.correctedAnswer }}</p></div>
+                </div>
+                <p v-if="appeal.reason" class="appeal-reason">申诉理由：{{ appeal.reason }}</p>
+                <p v-if="appeal.status === 'approved'" class="appeal-note">教师通过（{{ formatDate(appeal.decidedAt!) }}）：订正已写回本句与整课成绩。<template v-if="appeal.teacherNote">{{ appeal.teacherNote }}</template></p>
+                <p v-else-if="appeal.status === 'rejected'" class="appeal-note">驳回原因（{{ formatDate(appeal.decidedAt!) }}）：{{ appeal.teacherNote }}　原结果保留。</p>
+                <p v-else-if="appeal.conflictNote" class="appeal-note conflict">{{ appeal.conflictNote }}</p>
+                <p v-else-if="appeal.status === 'withdrawn'" class="appeal-note">你于 {{ formatDate(appeal.withdrawnAt!) }} 撤回，本单已失效。</p>
+              </div>
+
+              <!-- 无待处理单时才能开新单，避免同一句重复开单 -->
+              <div class="appeal-form">
+                <small class="appeal-form-label">订正答案（系统将按同一标准重新逐词判定）</small>
+                <textarea v-model="appealCorrection" class="appeal-input" rows="2" aria-label="逐句申诉订正答案"></textarea>
+                <small class="appeal-form-label">申诉理由（连读 / 同义表达 / 标点等）</small>
+                <input v-model="appealReason" class="appeal-input" placeholder="如：check in 连读被分成两个词" aria-label="逐句申诉理由" />
+                <var-button block type="primary" @click="submitAppeal">发起申诉</var-button>
+              </div>
+            </template>
+          </div>
         </section>
 
         <section v-if="resultAttempt.teacherFeedback" class="panel"><div class="feedback-card"><strong>教师反馈</strong><p>{{ resultAttempt.teacherFeedback }}</p></div></section>
@@ -401,13 +569,68 @@ onBeforeUnmount(() => {
           <div class="brand"><div class="brand-mark">T</div><div><h1>教师复核</h1><p>查看作答并写入反馈</p></div></div>
         </header>
 
+        <div class="section-head"><h3>逐句申诉队列</h3><span>{{ pendingAppealCount() }} 单待处理</span></div>
+        <div v-if="state.appeals.length" class="panel appeal-queue">
+          <article v-for="appeal in teacherAppeals" :key="appeal.id" class="appeal-card" :data-tone="appealStatusMeta[appeal.status].tone">
+            <div class="appeal-head">
+              <span class="appeal-badge">{{ appealStatusMeta[appeal.status].label }}</span>
+              <span class="appeal-time">{{ appealAttempt(appeal)?.lessonTitle ?? '已删除的作答' }} · 第 {{ appeal.sentenceIndex + 1 }} 句 · {{ formatDate(appeal.createdAt) }}</span>
+            </div>
+            <p class="appeal-source">原文：{{ appeal.source }}</p>
+            <div class="appeal-grid">
+              <div><small>学生原答案 · 原判 {{ appeal.originalScore }} 分</small><p>{{ appeal.originalAnswer || '（空）' }}</p></div>
+              <div><small>订正答案 · 重新判定 {{ appeal.correctedScore }} 分</small><p>{{ appeal.correctedAnswer }}</p></div>
+            </div>
+            <p v-if="appeal.reason" class="appeal-reason">学生理由：{{ appeal.reason }}</p>
+
+            <!-- 待处理：通过才写回单句与整课成绩；驳回必须写明原因 -->
+            <template v-if="appeal.status === 'pending'">
+              <textarea v-model="teacherAppealNotes[appeal.id]" class="appeal-input" rows="2" placeholder="处理意见；驳回时必须写明原因" aria-label="申诉处理意见"></textarea>
+              <div class="appeal-actions">
+                <var-button type="primary" size="small" @click="teacherDecideAppeal(appeal, 'approved')">通过并更新成绩</var-button>
+                <var-button type="danger" size="small" variant="outline" @click="teacherDecideAppeal(appeal, 'rejected')">驳回（保留原判）</var-button>
+              </div>
+            </template>
+
+            <!-- 处理期间学生撤回重提：旧单已失效，旧决定不能写回，仅可补记冲突缘由 -->
+            <template v-else-if="appeal.status === 'superseded'">
+              <p class="appeal-note conflict">{{ appeal.conflictNote }}</p>
+              <textarea v-model="teacherAppealNotes[appeal.id]" class="appeal-input" rows="2" placeholder="可补记当时的处理意见（仅留痕，不写回成绩）" aria-label="旧单补记意见"></textarea>
+              <div class="appeal-actions">
+                <var-button type="default" size="small" variant="outline" @click="teacherResolveStale(appeal, 'approved')">补记“迟到通过”</var-button>
+                <var-button type="default" size="small" variant="outline" @click="teacherResolveStale(appeal, 'rejected')">补记“迟到驳回”</var-button>
+              </div>
+            </template>
+
+            <template v-else>
+              <p v-if="appeal.status === 'approved'" class="appeal-note">已通过（{{ formatDate(appeal.decidedAt!) }}）：单句与整课成绩已更新。<template v-if="appeal.teacherNote">意见：{{ appeal.teacherNote }}</template></p>
+              <p v-else-if="appeal.status === 'rejected'" class="appeal-note">已驳回（{{ formatDate(appeal.decidedAt!) }}）：{{ appeal.teacherNote }}　原结果保留。</p>
+              <p v-else-if="appeal.conflictNote" class="appeal-note conflict">{{ appeal.conflictNote }}<template v-if="appeal.teacherNote">补记意见：{{ appeal.teacherNote }}</template></p>
+              <p v-else-if="appeal.status === 'withdrawn'" class="appeal-note">学生于 {{ formatDate(appeal.withdrawnAt!) }} 撤回。</p>
+            </template>
+          </article>
+        </div>
+        <div v-else class="empty-state"><strong>暂无逐句申诉</strong>学生在结果页对单句判罚有异议时会在此开单。</div>
+
+        <div class="section-head"><h3>作答与反馈</h3><span>{{ state.attempts.length }} 条</span></div>
         <div v-if="state.attempts.length" class="panel">
           <div class="dictation-label"><strong>选择一次作答</strong><span>{{ state.attempts.length }} 条</span></div>
           <var-select v-model="teacherAttemptId" placeholder="选择作答">
             <var-option v-for="attempt in state.attempts" :key="attempt.id" :label="`${attempt.lessonTitle} · ${attempt.score} 分 · ${formatDate(attempt.submittedAt)}`" :value="attempt.id" />
           </var-select>
           <template v-if="teacherAttempt">
-            <div class="feedback-card"><strong>{{ teacherAttempt.courseTitle }}</strong><p>{{ teacherAttempt.lessonTitle }} · 总分 {{ teacherAttempt.score }}，完成 {{ teacherAttempt.sentenceAttempts.length }} 句。</p></div>
+            <div class="feedback-card">
+              <strong>{{ teacherAttempt.courseTitle }}</strong>
+              <p>{{ teacherAttempt.lessonTitle }} · 当前总分 {{ teacherAttempt.score }}，完成 {{ teacherAttempt.sentenceAttempts.length }} 句。</p>
+              <p v-if="teacherAttempt.originalScore !== undefined && teacherAttempt.originalScore !== teacherAttempt.score" class="score-version">
+                申诉处理前整课 {{ teacherAttempt.originalScore }} 分 → 处理后 {{ teacherAttempt.score }} 分
+              </p>
+              <ul v-if="teacherAttempt.sentenceAttempts.some((item) => item.originalScore !== undefined && item.originalScore !== item.score)" class="sentence-diff">
+                <li v-for="(item, idx) in teacherAttempt.sentenceAttempts" :key="item.sentenceId">
+                  <template v-if="item.originalScore !== undefined && item.originalScore !== item.score">第 {{ idx + 1 }} 句：{{ item.originalScore }} → {{ item.score }} 分</template>
+                </li>
+              </ul>
+            </div>
             <div class="teacher-editor">
               <textarea v-model="teacherDraft" placeholder="给学生一条具体、可执行的反馈..." aria-label="教师反馈"></textarea>
               <var-button block type="primary" style="margin-top: 10px" @click="saveTeacherFeedback">保存反馈</var-button>

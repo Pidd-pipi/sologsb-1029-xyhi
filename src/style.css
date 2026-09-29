@@ -122,6 +122,42 @@ button, input, textarea { font: inherit; }
 .segmented button.active { background: var(--card); color: var(--text); box-shadow: 0 1px 5px rgb(0 0 0 / .09); font-weight: 700; }
 .empty-state { text-align: center; padding: 36px 20px; color: var(--muted); }
 .empty-state strong { display: block; color: var(--text); margin-bottom: 7px; }
+
+/* 逐句申诉 */
+.score-version { font-size: .7rem; margin: 8px 0 0; color: var(--primary); font-weight: 600; }
+.score-version.muted { color: var(--muted); font-weight: 400; }
+.score-old { color: var(--muted); font-weight: 500; text-decoration: line-through; text-decoration-color: var(--muted); }
+.appeal-zone { border-top: 1px dashed var(--line); margin-top: 18px; padding-top: 4px; }
+.appeal-card { border: 1px solid var(--line); border-left-width: 4px; border-radius: 14px; padding: 12px; margin-top: 12px; background: var(--card); }
+.appeal-card[data-tone='pending'] { border-left-color: var(--primary); background: var(--soft); }
+.appeal-card[data-tone='approved'] { border-left-color: var(--success); }
+.appeal-card[data-tone='rejected'] { border-left-color: var(--danger); }
+.appeal-card[data-tone='withdrawn'], .appeal-card[data-tone='superseded'] { border-left-color: var(--muted); opacity: .92; }
+.appeal-card[data-tone='conflict'] { border-left-color: #d08a00; background: #fff8e8; }
+[data-theme='dark'] .appeal-card[data-tone='conflict'] { background: #33290f; }
+.appeal-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
+.appeal-badge { font-size: .66rem; font-weight: 800; padding: 3px 9px; border-radius: 999px; background: var(--soft); color: var(--primary); white-space: nowrap; }
+.appeal-card[data-tone='approved'] .appeal-badge { background: color-mix(in srgb, var(--success) 16%, transparent); color: var(--success); }
+.appeal-card[data-tone='rejected'] .appeal-badge { background: color-mix(in srgb, var(--danger) 14%, transparent); color: var(--danger); }
+.appeal-card[data-tone='conflict'] .appeal-badge { background: color-mix(in srgb, #d08a00 20%, transparent); color: #a56c00; }
+.appeal-time { font-size: .64rem; color: var(--muted); }
+.appeal-source { font-size: .7rem; color: var(--muted); margin: 8px 0 0; }
+.appeal-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 9px; }
+.appeal-grid small { display: block; font-size: .62rem; color: var(--muted); margin-bottom: 3px; }
+.appeal-grid p { margin: 0; font-size: .73rem; line-height: 1.5; background: var(--app-bg); border-radius: 9px; padding: 7px 9px; min-height: 32px; word-break: break-word; }
+.appeal-reason { font-size: .72rem; margin: 9px 0 0; color: var(--text); }
+.appeal-note { font-size: .72rem; margin: 9px 0 0; color: var(--muted); line-height: 1.55; }
+.appeal-note.conflict { color: #a56c00; font-weight: 600; }
+.appeal-hint { font-size: .66rem; color: var(--muted); margin: 8px 0 10px; }
+.appeal-form { margin-top: 12px; display: flex; flex-direction: column; gap: 6px; }
+.appeal-form-label { font-size: .68rem; color: var(--muted); }
+.appeal-input { width: 100%; border: 1px solid var(--line); border-radius: 11px; padding: 9px 11px; background: var(--card); color: var(--text); font-size: .76rem; line-height: 1.5; resize: vertical; }
+.appeal-form .appeal-input { margin-bottom: 4px; }
+.appeal-actions { display: flex; gap: 8px; margin-top: 9px; flex-wrap: wrap; }
+.appeal-queue .appeal-card { box-shadow: none; }
+.sentence-diff { list-style: none; margin: 8px 0 0; padding: 0; font-size: .7rem; color: var(--muted); display: grid; gap: 3px; }
+.sentence-diff li:empty { display: none; }
+
 @media (min-width: 600px) {
   body { padding: 18px 0; }
   .app-shell { min-height: calc(100dvh - 36px); border-radius: 28px; }

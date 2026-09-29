@@ -76,6 +76,18 @@ export function compareSentence(expected: string, answer: string): TokenResult[]
   return result.map((token, index) => ({ ...token, index }));
 }
 
+/** 对纯数据（答案、逐词结果等）做深拷贝；可安全用于 Vue reactive 代理。 */
+export function cloneData<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+/** 对单句答案重新逐词比对并生成得分，提交作答与申诉订正共用同一套判定。 */
+export function gradeSentence(source: string, answer: string): { tokens: TokenResult[]; score: number } {
+  const tokens = compareSentence(source, answer);
+  const correct = tokens.filter((token) => token.correct).length;
+  return { tokens, score: tokens.length ? Math.round((correct / tokens.length) * 100) : 0 };
+}
+
 export function scoreAttempt(sentenceAttempts: SentenceAttempt[]): number {
   const totals = sentenceAttempts.flatMap((attempt) => attempt.tokens);
   if (!totals.length) return 0;

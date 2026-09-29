@@ -65,7 +65,7 @@ export const demoCourses: Course[] = [
 ];
 
 export const createInitialState = (): PersistedState => ({
-  schemaVersion: 1,
+  schemaVersion: 2,
   courses: structuredClone(demoCourses),
   attempts: [
     {
@@ -75,6 +75,7 @@ export const createInitialState = (): PersistedState => ({
       courseTitle: '日常英语 · 机场与出行',
       submittedAt: '2026-09-24T10:20:00.000Z',
       score: 84,
+      originalScore: 84,
       teacherFeedback: '连读细节明显进步。注意 bags are 的词尾衔接，再听一遍第二句。',
       sentenceAttempts: [
         {
@@ -82,6 +83,21 @@ export const createInitialState = (): PersistedState => ({
           source: 'I would like to check in for my flight to London.',
           answer: 'I would like to check in for my flight to London',
           score: 94,
+          originalAnswer: 'I would like to check in for my flight to London',
+          originalScore: 94,
+          originalTokens: [
+            { index: 0, expected: 'I', actual: 'I', correct: true, category: 'unclassified', reason: '' },
+            { index: 1, expected: 'would', actual: 'would', correct: true, category: 'unclassified', reason: '' },
+            { index: 2, expected: 'like', actual: 'like', correct: true, category: 'unclassified', reason: '' },
+            { index: 3, expected: 'to', actual: 'to', correct: true, category: 'unclassified', reason: '' },
+            { index: 4, expected: 'check', actual: 'check', correct: true, category: 'unclassified', reason: '' },
+            { index: 5, expected: 'in', actual: 'in', correct: true, category: 'unclassified', reason: '' },
+            { index: 6, expected: 'for', actual: 'for', correct: true, category: 'unclassified', reason: '' },
+            { index: 7, expected: 'my', actual: 'my', correct: true, category: 'unclassified', reason: '' },
+            { index: 8, expected: 'flight', actual: 'flight', correct: true, category: 'unclassified', reason: '' },
+            { index: 9, expected: 'to', actual: 'to', correct: true, category: 'unclassified', reason: '' },
+            { index: 10, expected: 'London', actual: 'London', correct: true, category: 'unclassified', reason: '' }
+          ],
           tokens: [
             { index: 0, expected: 'I', actual: 'I', correct: true, category: 'unclassified', reason: '' },
             { index: 1, expected: 'would', actual: 'would', correct: true, category: 'unclassified', reason: '' },
@@ -99,6 +115,7 @@ export const createInitialState = (): PersistedState => ({
       ]
     }
   ],
+  appeals: [],
   progress: {
     'airport-01': {
       answers: { 'airport-01-s1': 'I would like to check in for my flight to London' },
