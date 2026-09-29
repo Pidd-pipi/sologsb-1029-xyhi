@@ -99,6 +99,7 @@ export const createInitialState = (): PersistedState => ({
       ]
     }
   ],
+  appeals: [],
   progress: {
     'airport-01': {
       answers: { 'airport-01-s1': 'I would like to check in for my flight to London' },

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
-import { courseForLesson, exportRecords, lessonById, persist, saveAttempt, setDownloaded, state, updateTokenClassification } from './store';
-import type { ErrorCategory, Lesson, PracticeAttempt, PracticeView } from './types';
+import { appealsForAttempt, courseForLesson, createAppeal, exportRecords, lessonById, persist, processAppeal, saveAttempt, setDownloaded, state, updateTokenClassification, withdrawAppeal } from './store';
+import type { AppealStatus, ErrorCategory, Lesson, PracticeAttempt, PracticeView, SentenceAppeal } from './types';
 import { compareSentence, scoreAttempt, segmentText } from './utils';
 
 const view = ref<PracticeView>(state.activeLessonId ? 'practice' : 'library');
@@ -13,6 +13,12 @@ const segmentStart = ref(0);
 const segmentEnd = ref(1);
 const teacherAttemptId = ref(state.attempts[0]?.id ?? '');
 const teacherDraft = ref(state.attempts[0]?.teacherFeedback ?? '');
+// 申诉相关状态
+const appealFormSentenceId = ref('');
+const appealFormAnswer = ref('');
+const appealFormReason = ref('');
+const teacherNoteDrafts = ref<Record<string, string>>({});
+const processingAppealId = ref('');
 let toastTimer = 0;
 
 const activeLesson = computed(() => lessonById(state.activeLessonId));
@@ -38,6 +44,26 @@ const resultSentence = computed(() => resultAttempt.value?.sentenceAttempts[sele
 const teacherAttempt = computed(() => state.attempts.find((attempt) => attempt.id === teacherAttemptId.value));
 const totalWords = computed(() => state.attempts.flatMap((attempt) => attempt.sentenceAttempts).flatMap((item) => item.tokens).length);
 const correctedWords = computed(() => state.attempts.flatMap((attempt) => attempt.sentenceAttempts).flatMap((item) => item.tokens).filter((token) => !token.correct && token.category !== 'unclassified').length);
+
+// 申诉相关 computed
+const resultAppeals = computed(() => resultAttempt.value ? appealsForAttempt(resultAttempt.value.id) : []);
+const teacherAppeals = computed(() => teacherAttempt.value ? appealsForAttempt(teacherAttempt.value.id) : []);
+const pendingAppealCount = computed(() => state.appeals.filter((appeal) => appeal.status === 'pending').length);
+
+function appealForSentence(sentenceId: string): SentenceAppeal | undefined {
+  return resultAppeals.value.filter((appeal) => appeal.sentenceId === sentenceId).sort((a, b) => b.version - a.version)[0];
+}
+
+function pendingAppealForResultSentence(sentenceId: string): SentenceAppeal | undefined {
+  return resultAppeals.value.find((appeal) => appeal.sentenceId === sentenceId && appeal.status === 'pending');
+}
+
+const appealStatusMeta: Record<AppealStatus, { label: string; color: string }> = {
+  pending: { label: '待处理', color: '#b25e09' },
+  approved: { label: '已通过', color: '#138a63' },
+  rejected: { label: '已驳回', color: '#d83b45' },
+  withdrawn: { label: '已撤回', color: '#6f7b91' }
+};
 
 const categoryOptions: Array<{ value: ErrorCategory; label: string }> = [
   { value: 'unclassified', label: '未分类' },
@@ -188,6 +214,71 @@ function saveTeacherFeedback() {
   attempt.teacherFeedback = teacherDraft.value.trim();
   persist();
   notify('教师反馈已保存');
+}
+
+// ---- 申诉操作 ----
+
+function openAppealForm(sentenceId: string) {
+  appealFormSentenceId.value = sentenceId;
+  const sa = resultAttempt.value?.sentenceAttempts.find((item) => item.sentenceId === sentenceId);
+  appealFormAnswer.value = sa?.answer ?? '';
+  appealFormReason.value = '';
+}
+
+function closeAppealForm() {
+  appealFormSentenceId.value = '';
+  appealFormAnswer.value = '';
+  appealFormReason.value = '';
+}
+
+function submitAppeal() {
+  const attempt = resultAttempt.value;
+  if (!attempt || !appealFormSentenceId.value) return;
+  const result = createAppeal(attempt.id, appealFormSentenceId.value, appealFormAnswer.value, appealFormReason.value);
+  if (!result.ok) {
+    notify(result.error ?? '申诉提交失败');
+    return;
+  }
+  persist();
+  closeAppealForm();
+  notify('申诉已提交，等待教师处理');
+}
+
+function withdraw(appealId: string) {
+  if (!window.confirm('确定撤回这条申诉吗？撤回后可重新提交，旧申诉将失效。')) return;
+  const result = withdrawAppeal(appealId);
+  if (!result.ok) {
+    notify(result.error ?? '撤回失败');
+    return;
+  }
+  persist();
+  notify('申诉已撤回');
+}
+
+function startProcess(appealId: string) {
+  processingAppealId.value = appealId;
+  const appeal = state.appeals.find((item) => item.id === appealId);
+  if (appeal) teacherNoteDrafts.value[appealId] = appeal.teacherNote;
+}
+
+function cancelProcess() {
+  processingAppealId.value = '';
+}
+
+function confirmProcess(appealId: string, decision: 'approved' | 'rejected') {
+  const note = teacherNoteDrafts.value[appealId] ?? '';
+  const result = processAppeal(appealId, decision, note);
+  if (!result.ok) {
+    notify(result.error ?? '处理失败');
+    if (result.conflict) {
+      // 冲突已写入 appeal，刷新视图即可
+      processingAppealId.value = '';
+    }
+    return;
+  }
+  persist();
+  processingAppealId.value = '';
+  notify(decision === 'approved' ? '申诉已通过，成绩已更新' : '申诉已驳回，原结果保留');
 }
 
 function toggleTheme() {
@@ -390,6 +481,68 @@ onBeforeUnmount(() => {
           </div>
         </section>
 
+        <section v-if="resultSentence" class="panel appeal-panel">
+          <div class="detail-head">
+            <div><h3>逐句申诉</h3><p>系统判错与你主张不符（连读、同义表达等）时可申诉，教师通过后更新本句与整课成绩</p></div>
+          </div>
+
+          <template v-if="appealForSentence(resultSentence.sentenceId)">
+            <div class="appeal-card" :class="appealForSentence(resultSentence.sentenceId)!.status">
+              <div class="appeal-card-top">
+                <span class="appeal-badge" :style="{ background: appealStatusMeta[appealForSentence(resultSentence.sentenceId)!.status].color + '1f', color: appealStatusMeta[appealForSentence(resultSentence.sentenceId)!.status].color }">
+                  {{ appealStatusMeta[appealForSentence(resultSentence.sentenceId)!.status].label }}
+                </span>
+                <span class="appeal-version">第 {{ appealForSentence(resultSentence.sentenceId)!.version }} 版 · {{ formatDate(appealForSentence(resultSentence.sentenceId)!.createdAt) }}</span>
+              </div>
+
+              <div class="appeal-compare">
+                <div class="appeal-compare-col">
+                  <span class="appeal-compare-label">原判</span>
+                  <strong>{{ appealForSentence(resultSentence.sentenceId)!.originalScore }} 分</strong>
+                  <p>{{ appealForSentence(resultSentence.sentenceId)!.originalAnswer || '（未作答）' }}</p>
+                </div>
+                <div class="appeal-compare-arrow">→</div>
+                <div class="appeal-compare-col">
+                  <span class="appeal-compare-label">订正后</span>
+                  <strong>{{ resultSentence.score }} 分</strong>
+                  <p>{{ appealForSentence(resultSentence.sentenceId)!.correctedAnswer }}</p>
+                </div>
+              </div>
+
+              <div class="appeal-field"><span>申诉理由</span><p>{{ appealForSentence(resultSentence.sentenceId)!.appealReason }}</p></div>
+              <div v-if="appealForSentence(resultSentence.sentenceId)!.teacherNote" class="appeal-field"><span>教师意见</span><p>{{ appealForSentence(resultSentence.sentenceId)!.teacherNote }}</p></div>
+              <div v-if="appealForSentence(resultSentence.sentenceId)!.conflict" class="appeal-field conflict"><span>冲突缘由</span><p>{{ appealForSentence(resultSentence.sentenceId)!.conflictReason }}</p></div>
+
+              <div class="appeal-card-actions">
+                <var-button v-if="appealForSentence(resultSentence.sentenceId)!.status === 'pending'" size="small" type="default" variant="outline" @click="withdraw(appealForSentence(resultSentence.sentenceId)!.id)">撤回申诉</var-button>
+              </div>
+            </div>
+
+            <div v-if="resultAppeals.filter((a) => a.sentenceId === (resultSentence?.sentenceId ?? '')).length > 1" class="appeal-history">
+              <div class="appeal-history-title">历史版本</div>
+              <div v-for="old in resultAppeals.filter((a) => a.sentenceId === (resultSentence?.sentenceId ?? '')).slice().reverse().slice(1)" :key="old.id" class="appeal-history-item">
+                <span class="appeal-badge small" :style="{ background: appealStatusMeta[old.status].color + '1f', color: appealStatusMeta[old.status].color }">{{ appealStatusMeta[old.status].label }}</span>
+                <span>第 {{ old.version }} 版 · {{ formatDate(old.createdAt) }}</span>
+                <span v-if="old.conflict" class="appeal-conflict-tag">冲突</span>
+              </div>
+            </div>
+          </template>
+
+          <template v-if="!pendingAppealForResultSentence(resultSentence.sentenceId)">
+            <var-button v-if="appealFormSentenceId !== resultSentence.sentenceId" block type="primary" variant="outline" @click="openAppealForm(resultSentence.sentenceId)">对本句判错有异议？发起申诉</var-button>
+            <div v-else class="appeal-form">
+              <div class="dictation-label"><strong>订正答案</strong><span>你主张应被采纳的内容</span></div>
+              <textarea v-model="appealFormAnswer" class="answer-box" placeholder="Type what you actually said..."></textarea>
+              <div class="dictation-label"><strong>申诉理由</strong><span>如：连读、弱读、同义表达</span></div>
+              <input v-model="appealFormReason" class="appeal-reason-input" placeholder="如：could I 连读，系统误判为 could I..." />
+              <div class="appeal-form-actions">
+                <var-button size="small" type="default" variant="outline" @click="closeAppealForm">取消</var-button>
+                <var-button size="small" type="primary" @click="submitAppeal">提交申诉</var-button>
+              </div>
+            </div>
+          </template>
+        </section>
+
         <section v-if="resultAttempt.teacherFeedback" class="panel"><div class="feedback-card"><strong>教师反馈</strong><p>{{ resultAttempt.teacherFeedback }}</p></div></section>
         <var-button block type="primary" @click="startLesson(activeLesson!)">返回本次课程</var-button>
         <var-button block type="default" variant="outline" style="margin-top: 10px" @click="downloadRecords">导出练习记录</var-button>
@@ -411,6 +564,54 @@ onBeforeUnmount(() => {
             <div class="teacher-editor">
               <textarea v-model="teacherDraft" placeholder="给学生一条具体、可执行的反馈..." aria-label="教师反馈"></textarea>
               <var-button block type="primary" style="margin-top: 10px" @click="saveTeacherFeedback">保存反馈</var-button>
+            </div>
+
+            <div class="appeal-teacher-head">
+              <h4>逐句申诉处理</h4>
+              <span v-if="pendingAppealCount" class="appeal-pending-chip">{{ pendingAppealCount }} 条待处理</span>
+            </div>
+            <div v-if="!teacherAppeals.length" class="empty-state small"><strong>暂无申诉</strong>学生在结果页发起申诉后会出现在这里。</div>
+            <div v-for="appeal in teacherAppeals" :key="appeal.id" class="appeal-card" :class="[appeal.status, { conflict: appeal.conflict }]">
+              <div class="appeal-card-top">
+                <span class="appeal-badge" :style="{ background: appealStatusMeta[appeal.status].color + '1f', color: appealStatusMeta[appeal.status].color }">{{ appealStatusMeta[appeal.status].label }}</span>
+                <span class="appeal-version">第 {{ appeal.version }} 版 · {{ formatDate(appeal.createdAt) }}</span>
+              </div>
+              <div class="appeal-compare">
+                <div class="appeal-compare-col">
+                  <span class="appeal-compare-label">原判</span>
+                  <strong>{{ appeal.originalScore }} 分</strong>
+                  <p>{{ appeal.originalAnswer || '（未作答）' }}</p>
+                </div>
+                <div class="appeal-compare-arrow">→</div>
+                <div class="appeal-compare-col">
+                  <span class="appeal-compare-label">订正</span>
+                  <strong class="appeal-corrected">待核定</strong>
+                  <p>{{ appeal.correctedAnswer }}</p>
+                </div>
+              </div>
+              <div class="appeal-field"><span>申诉理由</span><p>{{ appeal.appealReason }}</p></div>
+
+              <template v-if="appeal.status === 'pending' || processingAppealId === appeal.id">
+                <div v-if="processingAppealId !== appeal.id" class="appeal-card-actions">
+                  <var-button size="small" type="primary" @click="startProcess(appeal.id)">通过</var-button>
+                  <var-button size="small" type="danger" variant="outline" @click="startProcess(appeal.id)">驳回</var-button>
+                </div>
+                <div v-else class="appeal-process-form">
+                  <div class="dictation-label"><strong>处理意见</strong><span>驳回时必填</span></div>
+                  <textarea v-model="teacherNoteDrafts[appeal.id]" class="answer-box small" placeholder="写明通过或驳回的原因..." aria-label="申诉处理意见"></textarea>
+                  <div class="appeal-form-actions">
+                    <var-button size="small" type="default" variant="outline" @click="cancelProcess">取消</var-button>
+                    <var-button size="small" type="danger" @click="confirmProcess(appeal.id, 'rejected')">确认驳回</var-button>
+                    <var-button size="small" type="primary" @click="confirmProcess(appeal.id, 'approved')">确认通过</var-button>
+                  </div>
+                </div>
+              </template>
+
+              <template v-else>
+                <div v-if="appeal.teacherNote" class="appeal-field"><span>教师意见</span><p>{{ appeal.teacherNote }}</p></div>
+                <div v-if="appeal.conflict" class="appeal-field conflict"><span>冲突缘由</span><p>{{ appeal.conflictReason }}</p></div>
+                <div class="appeal-processed-time">{{ appeal.processedAt ? formatDate(appeal.processedAt) : '' }}</div>
+              </template>
             </div>
           </template>
         </div>
